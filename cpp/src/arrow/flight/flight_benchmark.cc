@@ -192,6 +192,27 @@ arrow::Result<PerformanceResult> RunDoPutTest(FlightClient* client,
   int64_t records_sent = 0;
   const int64_t total_records = token.definition().records_per_stream();
   StopWatch timer;
+
+#define INTERLEAVE_PREPARE_AND_SEND  // !!!! uncomment to exercise old code path
+
+// tested on skylake server with two numa nodes, 16 cpus each.
+// - #stream = 1, see stable improvment of both bandwidth (1200 -> 1700) and latency (90 -> 70)
+// - #stream >= 4, no improvment, the benefit is hidden by parallel stream processing
+//
+// test command:
+// $ OMP_NUM_THREADS=4 numactl --membind=1 --cpunodebind=1 release/arrow-flight-benchmark --num_streams 1 --num_threads 1 --test_put
+// note: OMP_NUM_THREADS control #threads to do zstd compression
+
+#ifdef INTERLEAVE_PREPARE_AND_SEND
+  int cur = 0;
+  ipc::IpcPayload payload[2];
+  auto prepare_payload = [&]() { return writer->__Prepare(*batch, &payload[cur]); };
+  Future<> task;
+  // thread pool with one worker to prepare next payload
+  ARROW_ASSIGN_OR_RAISE(auto pool, ThreadPool::Make(1));
+  ARROW_ASSIGN_OR_RAISE(task, pool->Submit(prepare_payload));
+#endif
+
   while (records_sent < total_records) {
     if (records_sent + length > total_records) {
       const int last_length = total_records - records_sent;
@@ -202,7 +223,17 @@ arrow::Result<PerformanceResult> RunDoPutTest(FlightClient* client,
       records_sent += last_length;
     } else {
       timer.Start();
+#ifdef INTERLEAVE_PREPARE_AND_SEND
+      // wait for payload ready
+      RETURN_NOT_OK(task.status());
+      // prepare next playload in another thread
+      cur = 1 - cur;
+      ARROW_ASSIGN_OR_RAISE(task, pool->Submit(prepare_payload));
+      // send ready payload
+      RETURN_NOT_OK(writer->__Write(payload[1 - cur]));
+#else
       RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
+#endif
       stats->AddLatency(timer.Stop());
       num_records += length;
       // Hard-coded
